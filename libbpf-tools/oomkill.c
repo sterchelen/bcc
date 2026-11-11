@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 // Copyright (c) 2022 Jingxiang Zeng
+// Copyright (c) 2022 Krisztian Fekete
 //
 // Based on oomkill(8) from BCC by Brendan Gregg.
 // 13-Jan-2022   Jingxiang Zeng   Created this.
+// 17-Oct-2022   Krisztian Fekete Edited this.
 #include <argp.h>
 #include <errno.h>
 #include <signal.h>
@@ -15,11 +17,10 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include "oomkill.skel.h"
+#include "compat.h"
 #include "oomkill.h"
 #include "btf_helpers.h"
 #include "trace_helpers.h"
-
-#define PERF_POLL_TIMEOUT_MS	100
 
 static volatile sig_atomic_t exiting = 0;
 
@@ -37,8 +38,8 @@ const char argp_program_doc[] =
 "    oomkill               # trace OOM kills\n";
 
 static const struct argp_option opts[] = {
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help" },
+	{ "verbose", 'v', NULL, 0, "Verbose debug output", 0 },
+	{ NULL, 'h', NULL, OPTION_HIDDEN, "Show the full help", 0 },
 	{},
 };
 
@@ -57,32 +58,22 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	return 0;
 }
 
-static void handle_event(void *ctx, int cpu, void *data, __u32 data_sz)
+static int handle_event(void *ctx, void *data, size_t len)
 {
-	FILE *f;
-	char buf[256];
-	int n = 0;
-	struct tm *tm;
+	char loadavg[256];
 	char ts[32];
-	time_t t;
 	struct data_t *e = data;
 
-	f = fopen("/proc/loadavg", "r");
-	if (f) {
-		memset(buf, 0, sizeof(buf));
-		n = fread(buf, 1, sizeof(buf), f);
-		fclose(f);
-	}
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+	str_timestamp("%H:%M:%S", ts, sizeof(ts));
 
-	if (n)
+	if (str_loadavg(loadavg, sizeof(loadavg)) > 0)
 		printf("%s Triggered by PID %d (\"%s\"), OOM kill of PID %d (\"%s\"), %lld pages, loadavg: %s",
-			ts, e->fpid, e->fcomm, e->tpid, e->tcomm, e->pages, buf);
+			ts, e->fpid, e->fcomm, e->tpid, e->tcomm, e->pages, loadavg);
 	else
 		printf("%s Triggered by PID %d (\"%s\"), OOM kill of PID %d (\"%s\"), %lld pages\n",
 			ts, e->fpid, e->fcomm, e->tpid, e->tcomm, e->pages);
+
+	return 0;
 }
 
 static void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt)
@@ -110,7 +101,7 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
-	struct perf_buffer *pb = NULL;
+	struct bpf_buffer *buf = NULL;
 	struct oomkill_bpf *obj;
 	int err;
 
@@ -118,7 +109,6 @@ int main(int argc, char **argv)
 	if (err)
 		return err;
 
-	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
 
 	err = ensure_core_btf(&open_opts);
@@ -133,6 +123,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	buf = bpf_buffer__new(obj->maps.events, obj->maps.heap);
+	if (!buf) {
+		err = -errno;
+		fprintf(stderr, "failed to create ring/perf buffer: %d\n", err);
+		goto cleanup;
+	}
+
 	err = oomkill_bpf__load(obj);
 	if (err) {
 		fprintf(stderr, "failed to load BPF object: %d\n", err);
@@ -145,11 +142,9 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	pb = perf_buffer__new(bpf_map__fd(obj->maps.events), 64,
-			      handle_event, handle_lost_events, NULL, NULL);
-	if (!pb) {
-		err = -errno;
-		fprintf(stderr, "failed to open perf buffer: %d\n", err);
+	err = bpf_buffer__open(buf, handle_event, handle_lost_events, NULL);
+	if (err) {
+		fprintf(stderr, "failed to open ring/perf buffer: %d\n", err);
 		goto cleanup;
 	}
 
@@ -162,9 +157,9 @@ int main(int argc, char **argv)
 	printf("Tracing OOM kills... Ctrl-C to stop.\n");
 
 	while (!exiting) {
-		err = perf_buffer__poll(pb, PERF_POLL_TIMEOUT_MS);
+		err = bpf_buffer__poll(buf, POLL_TIMEOUT_MS);
 		if (err < 0 && err != -EINTR) {
-			fprintf(stderr, "error polling perf buffer: %d\n", err);
+			fprintf(stderr, "error polling ring/perf buffer: %d\n", err);
 			goto cleanup;
 		}
 		/* reset err to return 0 if exiting */
@@ -172,7 +167,7 @@ int main(int argc, char **argv)
 	}
 
 cleanup:
-	perf_buffer__free(pb);
+	bpf_buffer__free(buf);
 	oomkill_bpf__destroy(obj);
 	cleanup_core_btf(&open_opts);
 

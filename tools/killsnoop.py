@@ -4,7 +4,7 @@
 # killsnoop Trace signals issued by the kill() syscall.
 #           For Linux, uses BCC, eBPF. Embedded C.
 #
-# USAGE: killsnoop [-h] [-x] [-p PID]
+# USAGE: killsnoop [-h] [-x] [-p PID] [-T PID] [-s SIGNAL]
 #
 # Copyright (c) 2015 Brendan Gregg.
 # Licensed under the Apache License, Version 2.0 (the "License")
@@ -23,7 +23,9 @@ examples = """examples:
     ./killsnoop           # trace all kill() signals
     ./killsnoop -x        # only show failed kills
     ./killsnoop -p 181    # only trace PID 181
+    ./killsnoop -T 189    # only trace target PID 189
     ./killsnoop -s 9      # only trace signal 9
+    ./killsnoop -s 9,15   # trace signal 9 and 15
 """
 parser = argparse.ArgumentParser(
     description="Trace signals issued by the kill() syscall",
@@ -32,9 +34,11 @@ parser = argparse.ArgumentParser(
 parser.add_argument("-x", "--failed", action="store_true",
     help="only show failed kill syscalls")
 parser.add_argument("-p", "--pid",
-    help="trace this PID only")
+    help="trace this PID only which is the sender of signal")
+parser.add_argument("-T", "--tpid",
+    help="trace this target PID only which is the receiver of signal")
 parser.add_argument("-s", "--signal",
-    help="trace this signal only")
+    help="trace a signal or a signal list")
 parser.add_argument("--ebpf", action="store_true",
     help=argparse.SUPPRESS)
 args = parser.parse_args()
@@ -63,12 +67,14 @@ struct data_t {
 BPF_HASH(infotmp, u32, struct val_t);
 BPF_PERF_OUTPUT(events);
 
-int syscall__kill(struct pt_regs *ctx, int tpid, int sig)
+
+static int probe_entry(u32 tpid, int sig)
 {
     u64 pid_tgid = bpf_get_current_pid_tgid();
     u32 pid = pid_tgid >> 32;
     u32 tid = (u32)pid_tgid;
 
+    TPID_FILTER
     PID_FILTER
     SIGNAL_FILTER
 
@@ -80,9 +86,24 @@ int syscall__kill(struct pt_regs *ctx, int tpid, int sig)
     }
 
     return 0;
-};
+}
 
-int do_ret_sys_kill(struct pt_regs *ctx)
+TRACEPOINT_PROBE(syscalls, sys_enter_kill)
+{
+    return probe_entry(args->pid, args->sig);
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_tkill)
+{
+    return probe_entry(args->pid, args->sig);
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_tgkill)
+{
+    return probe_entry(args->pid, args->sig);
+}
+
+static int probe_exit(void *ctx, int ret)
 {
     struct data_t data = {};
     struct val_t *valp;
@@ -99,7 +120,7 @@ int do_ret_sys_kill(struct pt_regs *ctx)
     bpf_probe_read_kernel(&data.comm, sizeof(data.comm), valp->comm);
     data.pid = pid;
     data.tpid = valp->tpid;
-    data.ret = PT_REGS_RC(ctx);
+    data.ret = ret;
     data.sig = valp->sig;
 
     events.perf_submit(ctx, &data, sizeof(data));
@@ -107,17 +128,44 @@ int do_ret_sys_kill(struct pt_regs *ctx)
 
     return 0;
 }
+
+TRACEPOINT_PROBE(syscalls, sys_exit_kill)
+{
+    return probe_exit(args, args->ret);
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_tkill)
+{
+    return probe_exit(args, args->ret);
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_tgkill)
+{
+    return probe_exit(args, args->ret);
+}
+
 """
+
+if args.tpid:
+    bpf_text = bpf_text.replace('TPID_FILTER',
+        'if (tpid != %s) { return 0; }' % args.tpid)
+else:
+    bpf_text = bpf_text.replace('TPID_FILTER', '')
+
 if args.pid:
     bpf_text = bpf_text.replace('PID_FILTER',
         'if (pid != %s) { return 0; }' % args.pid)
 else:
     bpf_text = bpf_text.replace('PID_FILTER', '')
+
 if args.signal:
+    signals = args.signal.split(',')
+    signal_filter = ' && '.join(['sig != %s' % signal for signal in signals])
     bpf_text = bpf_text.replace('SIGNAL_FILTER',
-        'if (sig != %s) { return 0; }' % args.signal)
+        'if (%s) { return 0; }' % signal_filter)
 else:
     bpf_text = bpf_text.replace('SIGNAL_FILTER', '')
+
 if debug or args.ebpf:
     print(bpf_text)
     if args.ebpf:
@@ -125,13 +173,19 @@ if debug or args.ebpf:
 
 # initialize BPF
 b = BPF(text=bpf_text)
-kill_fnname = b.get_syscall_fnname("kill")
-b.attach_kprobe(event=kill_fnname, fn_name="syscall__kill")
-b.attach_kretprobe(event=kill_fnname, fn_name="do_ret_sys_kill")
+
+# detect the length of PID column
+pid_bytes = 6
+try:
+    with open("/proc/sys/kernel/pid_max", 'r') as f:
+        pid_bytes = len(f.read().strip()) + 1
+        f.close()
+except:
+    pass # not fatal error, just use the default value
 
 # header
-print("%-9s %-6s %-16s %-4s %-6s %s" % (
-    "TIME", "PID", "COMM", "SIG", "TPID", "RESULT"))
+print("%-9s %-*s %-16s %-4s %-*s %s" % (
+    "TIME", pid_bytes, "PID", "COMM", "SIG", pid_bytes, "TPID", "RESULT"))
 
 # process event
 def print_event(cpu, data, size):
@@ -140,8 +194,8 @@ def print_event(cpu, data, size):
     if (args.failed and (event.ret >= 0)):
         return
 
-    printb(b"%-9s %-6d %-16s %-4d %-6d %d" % (strftime("%H:%M:%S").encode('ascii'),
-        event.pid, event.comm, event.sig, event.tpid, event.ret))
+    printb(b"%-9s %-*d %-16s %-4d %-*d %d" % (strftime("%H:%M:%S").encode('ascii'),
+        pid_bytes, event.pid, event.comm, event.sig, pid_bytes, event.tpid, event.ret))
 
 # loop with callback to print_event
 b["events"].open_perf_buffer(print_event)

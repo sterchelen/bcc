@@ -13,11 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <fcntl.h>
 #include <dlfcn.h>
-#include <stdint.h>
-#include <string.h>
+#include <fcntl.h>
 #include <link.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -25,15 +26,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cstdlib>
+
 #include "bcc_elf.h"
 #include "bcc_perf_map.h"
 #include "bcc_proc.h"
 #include "bcc_syms.h"
+#include "catch.hpp"
 #include "common.h"
 #include "vendor/tinyformat.hpp"
-
-#include "catch.hpp"
-
 
 using namespace std;
 
@@ -45,7 +46,7 @@ TEST_CASE("language detection", "[c_api]") {
   REQUIRE(string(c).compare("c") == 0);
 }
 
-TEST_CASE("shared object resolution", "[c_api]") {
+TEST_CASE("shared object resolution with the generalized function", "[c_api]") {
   char *libm = bcc_procutils_which_so("m", 0);
   REQUIRE(libm);
   REQUIRE(libm[0] == '/');
@@ -54,11 +55,43 @@ TEST_CASE("shared object resolution", "[c_api]") {
 }
 
 TEST_CASE("shared object resolution using loaded libraries", "[c_api]") {
+  char *libelf = bcc_procutils_which_so_in_process("elf", getpid());
+  REQUIRE(libelf);
+  REQUIRE(libelf[0] == '/');
+  REQUIRE(string(libelf).find("libelf") != string::npos);
+  free(libelf);
+}
+
+TEST_CASE("shared object resolution using loaded libraries with the generalized function", "[c_api]") {
   char *libelf = bcc_procutils_which_so("elf", getpid());
   REQUIRE(libelf);
   REQUIRE(libelf[0] == '/');
   REQUIRE(string(libelf).find("libelf") != string::npos);
   free(libelf);
+}
+
+TEST_CASE("versioned shared object resolution with the generalized function", "[c_api]") {
+  char *libc = bcc_procutils_which_so("c.so.6", 0);
+  REQUIRE(libc);
+  REQUIRE(libc[0] == '/');
+  REQUIRE(string(libc).find("libc.so.6") != string::npos);
+  free(libc);
+}
+
+TEST_CASE("versioned shared object resolution using loaded libraries", "[c_api]") {
+  char *libc = bcc_procutils_which_so_in_process("c.so.6", getpid());
+  REQUIRE(libc);
+  REQUIRE(libc[0] == '/');
+  REQUIRE(string(libc).find("libc.so.6") != string::npos);
+  free(libc);
+}
+
+TEST_CASE("versioned shared object resolution using loaded libraries with the generalized function", "[c_api]") {
+  char *libc = bcc_procutils_which_so("c.so.6", getpid());
+  REQUIRE(libc);
+  REQUIRE(libc[0] == '/');
+  REQUIRE(string(libc).find("libc.so.6") != string::npos);
+  free(libc);
 }
 
 TEST_CASE("binary resolution with `which`", "[c_api]") {
@@ -110,6 +143,105 @@ TEST_CASE("resolve symbol name in external library using loaded libraries", "[c_
   REQUIRE(sym.offset != 0);
   bcc_procutils_free(sym.module);
 }
+
+namespace {
+
+static std::string zipped_lib_path() {
+  return CMAKE_CURRENT_BINARY_DIR "/archive.zip!/libdebuginfo_test_lib.so";
+}
+
+}  // namespace
+
+TEST_CASE("resolve symbol name in external zipped library", "[c_api]") {
+  struct bcc_symbol sym;
+  REQUIRE(bcc_resolve_symname(zipped_lib_path().c_str(), "symbol", 0x0, 0,
+                              nullptr, &sym) == 0);
+  REQUIRE(sym.module == zipped_lib_path());
+  REQUIRE(sym.offset != 0);
+  bcc_procutils_free(sym.module);
+}
+
+namespace {
+
+void system(const std::string &command) {
+  if (::system(command.c_str())) {
+    abort();
+  }
+}
+
+class TmpDir {
+ public:
+  TmpDir() : path_("/tmp/bcc-test-XXXXXX") {
+    if (::mkdtemp(&path_[0]) == nullptr) {
+      abort();
+    }
+  }
+
+  ~TmpDir() { system("rm -rf " + path_); }
+
+  const std::string &path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
+void test_debuginfo_only_symbol(const std::string &lib) {
+  struct bcc_symbol sym;
+  REQUIRE(bcc_resolve_symname(lib.c_str(), "debuginfo_only_symbol", 0x0, 0,
+                              nullptr, &sym) == 0);
+  REQUIRE(sym.module[0] == '/');
+  REQUIRE(sym.offset != 0);
+  bcc_procutils_free(sym.module);
+}
+
+}  // namespace
+
+TEST_CASE("resolve symbol name via symfs", "[c_api]") {
+  TmpDir tmpdir;
+  std::string lib_path = tmpdir.path() + "/lib.so";
+  std::string symfs = tmpdir.path() + "/symfs";
+  std::string symfs_lib_dir = symfs + "/" + tmpdir.path();
+  std::string symfs_lib_path = symfs_lib_dir + "/lib.so";
+
+  system("mkdir -p " + symfs);
+  system("cp " CMAKE_CURRENT_BINARY_DIR "/libdebuginfo_test_lib.so " +
+         lib_path);
+  system("mkdir -p " + symfs_lib_dir);
+  system("cp " CMAKE_CURRENT_BINARY_DIR "/debuginfo.so " + symfs_lib_path);
+
+  ::setenv("BCC_SYMFS", symfs.c_str(), 1);
+  test_debuginfo_only_symbol(lib_path);
+  ::unsetenv("BCC_SYMFS");
+}
+
+TEST_CASE("resolve symbol name via buildid", "[c_api]") {
+  char build_id[128] = {0};
+  REQUIRE(bcc_elf_get_buildid(CMAKE_CURRENT_BINARY_DIR
+                              "/libdebuginfo_test_lib.so",
+                              build_id) == 0);
+
+  TmpDir tmpdir;
+  std::string debugso_dir =
+      tmpdir.path() + "/.build-id/" + build_id[0] + build_id[1];
+  std::string debugso = debugso_dir + "/" + (build_id + 2) + ".debug";
+  system("mkdir -p " + debugso_dir);
+  system("cp " CMAKE_CURRENT_BINARY_DIR "/debuginfo.so " + debugso);
+
+  ::setenv("BCC_DEBUGINFO_ROOT", tmpdir.path().c_str(), 1);
+  test_debuginfo_only_symbol(CMAKE_CURRENT_BINARY_DIR
+                             "/libdebuginfo_test_lib.so");
+  ::unsetenv("BCC_DEBUGINFO_ROOT");
+}
+
+TEST_CASE("resolve symbol name via gnu_debuglink", "[c_api]") {
+  test_debuginfo_only_symbol(CMAKE_CURRENT_BINARY_DIR "/with_gnu_debuglink.so");
+}
+
+#ifdef HAVE_LIBLZMA
+TEST_CASE("resolve symbol name via mini debug info", "[c_api]") {
+  test_debuginfo_only_symbol(CMAKE_CURRENT_BINARY_DIR "/with_gnu_debugdata.so");
+}
+#endif
 
 extern "C" int _a_test_function(const char *a_string) {
   int i;
@@ -315,6 +447,103 @@ TEST_CASE("resolve symbol addresses for a given PID", "[c_api]") {
   }
   bcc_free_symcache(resolver, getpid());
   bcc_free_symcache(lazy_resolver, getpid());
+}
+
+TEST_CASE("resolve symbol addresses for an exited process", "[c-api]") {
+  struct bcc_symbol sym;
+  struct bcc_symbol lazy_sym;
+  static struct bcc_symbol_option lazy_opt {
+    .use_debug_file = 1, .check_debug_file_crc = 1, .lazy_symbolize = 1,
+#if defined(__powerpc64__) && defined(_CALL_ELF) && _CALL_ELF == 2
+    .use_symbol_type = BCC_SYM_ALL_TYPES | (1 << STT_PPC64_ELFV2_SYM_LEP),
+#else
+    .use_symbol_type = BCC_SYM_ALL_TYPES,
+#endif
+  };
+
+  SECTION("resolve in current namespace") {
+    pid_t child = spawn_child(nullptr, false, false, [](void *) {
+      sleep(5);
+      return 0;
+    });
+    void *resolver = bcc_symcache_new(child, nullptr);
+    void *lazy_resolver = bcc_symcache_new(child, &lazy_opt);
+
+    REQUIRE(resolver);
+    REQUIRE(lazy_resolver);
+
+    kill(child, SIGTERM);
+
+    REQUIRE(bcc_symcache_resolve(resolver, (uint64_t)&_a_test_function, &sym) ==
+            0);
+
+    char *this_exe = realpath("/proc/self/exe", NULL);
+    REQUIRE(string(this_exe) == sym.module);
+    free(this_exe);
+
+    REQUIRE(string("_a_test_function") == sym.name);
+
+    REQUIRE(bcc_symcache_resolve(lazy_resolver, (uint64_t)&_a_test_function,
+                                 &lazy_sym) == 0);
+    REQUIRE(string(lazy_sym.name) == sym.name);
+    REQUIRE(string(lazy_sym.module) == sym.module);
+  }
+
+  SECTION("resolve in separate pid namespace") {
+    pid_t child = spawn_child(nullptr, true, false, [](void *) {
+      sleep(5);
+      return 0;
+    });
+    void *resolver = bcc_symcache_new(child, nullptr);
+    void *lazy_resolver = bcc_symcache_new(child, &lazy_opt);
+
+    REQUIRE(resolver);
+    REQUIRE(lazy_resolver);
+
+    kill(child, SIGTERM);
+
+    REQUIRE(bcc_symcache_resolve(resolver, (uint64_t)&_a_test_function, &sym) ==
+            0);
+
+    char *this_exe = realpath("/proc/self/exe", NULL);
+    REQUIRE(string(this_exe) == sym.module);
+    free(this_exe);
+
+    REQUIRE(string("_a_test_function") == sym.name);
+
+    REQUIRE(bcc_symcache_resolve(lazy_resolver, (uint64_t)&_a_test_function,
+                                 &lazy_sym) == 0);
+    REQUIRE(string(lazy_sym.name) == sym.name);
+    REQUIRE(string(lazy_sym.module) == sym.module);
+  }
+
+  SECTION("resolve in separate pid and mount namespace") {
+    pid_t child = spawn_child(nullptr, true, true, [](void *) {
+      sleep(5);
+      return 0;
+    });
+    void *resolver = bcc_symcache_new(child, nullptr);
+    void *lazy_resolver = bcc_symcache_new(child, &lazy_opt);
+
+    REQUIRE(resolver);
+    REQUIRE(lazy_resolver);
+
+    kill(child, SIGTERM);
+
+    REQUIRE(bcc_symcache_resolve(resolver, (uint64_t)&_a_test_function, &sym) ==
+            0);
+
+    char *this_exe = realpath("/proc/self/exe", NULL);
+    REQUIRE(string(this_exe) == sym.module);
+    free(this_exe);
+
+    REQUIRE(string("_a_test_function") == sym.name);
+
+    REQUIRE(bcc_symcache_resolve(lazy_resolver, (uint64_t)&_a_test_function,
+                                 &lazy_sym) == 0);
+    REQUIRE(string(lazy_sym.name) == sym.name);
+    REQUIRE(string(lazy_sym.module) == sym.module);
+  }
 }
 
 #define STACK_SIZE (1024 * 1024)
@@ -589,6 +818,27 @@ TEST_CASE("searching for modules in /proc/[pid]/maps", "[c_api][!mayfail]") {
   }
 
   fclose(dummy_maps);
+
+  SECTION("seach for lib in zip") {
+    std::string line =
+        "7f151476e000-7f1514779000 r-xp 00001000 00:1b "
+        "72809479 " CMAKE_CURRENT_BINARY_DIR "/archive.zip\n";
+    dummy_maps = fmemopen(nullptr, line.size(), "w+");
+    REQUIRE(fwrite(line.c_str(), line.size(), 1, dummy_maps) == 1);
+    fseek(dummy_maps, 0, SEEK_SET);
+
+    struct mod_search search;
+    memset(&search, 0, sizeof(struct mod_search));
+    std::string zip_entry_path = zipped_lib_path();
+    search.name = zip_entry_path.c_str();
+    int res = _procfs_maps_each_module(dummy_maps, getpid(),
+                                       _bcc_syms_find_module, &search);
+    REQUIRE(res == 0);
+    REQUIRE(search.start == 0x7f151476e000);
+    REQUIRE(search.file_offset < 0x1000);
+
+    fclose(dummy_maps);
+  }
 }
 
 TEST_CASE("resolve global addr in libc in this process", "[c_api][!mayfail]") {
